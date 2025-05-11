@@ -32,6 +32,9 @@ TOPIC = ""
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger()
 
+# Confidence threshold for sending person detections
+PERSON_CONFIDENCE_THRESHOLD = 0.7
+
 # -----------------------------------------------------------------------------------------------
 # User-defined class to be used in the callback function
 # -----------------------------------------------------------------------------------------------
@@ -46,6 +49,10 @@ class user_app_callback_class(app_callback_class):
         self.mqtt_lock = threading.Lock()
         self.device_id = f"raspberry-pi-5-{uuid.uuid4().hex[:6]}"
         self.setup_aws_iot()
+        
+        # Global cooldown to prevent message flooding
+        self.last_message_time = 0
+        self.global_cooldown = 5  # Seconds
 
     def new_function(self):  # New function example
         return "The meaning of life is: "
@@ -114,6 +121,9 @@ class user_app_callback_class(app_callback_class):
 
 # This is the callback function that will be called when data is available from the pipeline
 def app_callback(pad, info, user_data):
+    # Start timing for performance measurement
+    start_time = time.time()
+    
     # Get the GstBuffer from the probe info
     buffer = info.get_buffer()
     # Check if the buffer is valid
@@ -139,6 +149,7 @@ def app_callback(pad, info, user_data):
 
     # Parse the detections
     detection_count = 0
+    person_detection_count = 0  # Count only person detections
     detections_data = []
     current_time = time.time()
     
@@ -147,25 +158,43 @@ def app_callback(pad, info, user_data):
         bbox = detection.get_bbox()
         confidence = detection.get_confidence()
         
-        if label == "person":
+        # Only process detections labeled as "person" with confidence above threshold
+        if label == "person" and confidence >= PERSON_CONFIDENCE_THRESHOLD:
             # Get track ID
             track_id = 0
             track = detection.get_objects_typed(hailo.HAILO_UNIQUE_ID)
             if len(track) == 1:
                 track_id = track[0].get_id()
                 
-            string_to_print += (f"Detection: ID: {track_id} Label: {label} Confidence: {confidence:.2f}\n")
-            detection_count += 1
+            string_to_print += (f"Person Detection: ID: {track_id} Confidence: {confidence:.2f}\n")
+            person_detection_count += 1
+            
+            # Helper function to safely get a value from bbox
+            def safe_get_value(obj, names):
+                for name in names:
+                    if name in dir(obj):
+                        value = getattr(obj, name)
+                        if callable(value):
+                            return value()
+                        else:
+                            return value
+                return 0
+            
+            # Get bbox values using the helper function
+            bbox_x = safe_get_value(bbox, ["x", "xmin", "x_min", "get_x", "get_xmin", "get_x_min", "left"])
+            bbox_y = safe_get_value(bbox, ["y", "ymin", "y_min", "get_y", "get_ymin", "get_y_min", "top"])
+            bbox_width = safe_get_value(bbox, ["width", "get_width", "w", "get_w"])
+            bbox_height = safe_get_value(bbox, ["height", "get_height", "h", "get_h"])
             
             # Add detection data to the list
             detection_info = {
                 "track_id": int(track_id),
                 "confidence": float(confidence),
                 "bbox": {
-                    "x": float(bbox.x),
-                    "y": float(bbox.y),
-                    "width": float(bbox.width),
-                    "height": float(bbox.height)
+                    "x": float(bbox_x),
+                    "y": float(bbox_y),
+                    "width": float(bbox_width),
+                    "height": float(bbox_height)
                 }
             }
             detections_data.append(detection_info)
@@ -179,30 +208,59 @@ def app_callback(pad, info, user_data):
                 
             if should_send:
                 user_data.detection_history[track_id] = current_time
+        elif label == "person":
+            # Person detected but below confidence threshold
+            string_to_print += (f"Low confidence person: ID: {track_id if 'track_id' in locals() else 'N/A'} Confidence: {confidence:.2f} (below threshold)\n")
+            detection_count += 1
+        else:
+            # Non-person detection
+            string_to_print += (f"Non-person detection: Label: {label} Confidence: {confidence:.2f}\n")
+            detection_count += 1
     
-    # If people are detected, send the data to AWS IoT Core
-    if detection_count > 0 and detections_data:
+    # Calculate total processing time
+    processing_time = (time.time() - start_time) * 1000  # in milliseconds
+    
+    # Global cooldown check - only send if enough time has passed since last message
+    should_send_global = (current_time - user_data.last_message_time) >= user_data.global_cooldown
+    
+    # If people are detected above threshold and cooldown has elapsed, send the data
+    if person_detection_count > 0 and detections_data and should_send_global:
         # Send detection using a separate thread to avoid blocking the pipeline
         threading.Thread(
             target=user_data.send_detection_to_aws,
-            args=(detection_count, detections_data),
+            args=(person_detection_count, detections_data),
             daemon=True
         ).start()
+        
+        # Update the global last message time
+        user_data.last_message_time = current_time
+        
+        string_to_print += f"Sending {person_detection_count} person detections to AWS IoT Core\n"
+    elif person_detection_count > 0 and not should_send_global:
+        string_to_print += f"Person detected but in cooldown period ({user_data.global_cooldown - (current_time - user_data.last_message_time):.1f}s remaining)\n"
+    else:
+        string_to_print += "No confident person detections, not sending to AWS\n"
     
     if user_data.use_frame:
-        # Note: using imshow will not work here, as the callback function is not running in the main thread
-        # Let's print the detection count to the frame
-        cv2.putText(frame, f"Detections: {detection_count}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        # Example of how to use the new_variable and new_function from the user_data
-        # Let's print the new_variable and the result of the new_function to the frame
-        cv2.putText(frame, f"{user_data.new_function()} {user_data.new_variable}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        # Print the detection count to the frame
+        cv2.putText(frame, f"Person Detections: {person_detection_count}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        cv2.putText(frame, f"Other Detections: {detection_count - person_detection_count}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        cv2.putText(frame, f"Threshold: {PERSON_CONFIDENCE_THRESHOLD}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        
+        # Show processing time
+        cv2.putText(frame, f"Processing: {processing_time:.1f}ms", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        
         # Add AWS IoT status
         connection_status = "Connected" if user_data.mqtt_client else "Disconnected"
-        cv2.putText(frame, f"AWS IoT: {connection_status}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        cv2.putText(frame, f"AWS IoT: {connection_status}", (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        
         # Convert the frame to BGR
         frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         user_data.set_frame(frame)
 
+    # Add processing time to output
+    string_to_print += f"Processing time: {processing_time:.2f}ms\n"
+    
     print(string_to_print)
     return Gst.PadProbeReturn.OK
 
@@ -210,4 +268,10 @@ if __name__ == "__main__":
     # Create an instance of the user app callback class
     user_data = user_app_callback_class()
     app = GStreamerDetectionApp(app_callback, user_data)
-    app.run()
+    
+    try:
+        app.run()
+    except KeyboardInterrupt:
+        print("Application stopped by user")
+    except Exception as e:
+        print(f"Application stopped due to error: {e}")
